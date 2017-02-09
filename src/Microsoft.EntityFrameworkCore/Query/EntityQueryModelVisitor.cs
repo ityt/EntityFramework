@@ -344,6 +344,8 @@ namespace Microsoft.EntityFrameworkCore.Query
         {
             Check.NotNull(queryModel, nameof(queryModel));
 
+            new OfTypeResultOperatorOptimizer(QueryCompilationContext).VisitQueryModel(queryModel);
+
             _queryOptimizer.Optimize(QueryCompilationContext.QueryAnnotations, queryModel);
 
             var entityEqualityRewritingExpressionVisitor
@@ -397,22 +399,97 @@ namespace Microsoft.EntityFrameworkCore.Query
 
                 queryModel.TransformExpressions(new RecursiveQueryModelExpressionVisitor(this).Visit);
             }
+        }
 
-            private class RecursiveQueryModelExpressionVisitor : ExpressionVisitorBase
+        private class OfTypeResultOperatorOptimizer : QueryModelVisitorBase
+        {
+            private readonly QueryCompilationContext _queryCompilationContext;
+
+            public OfTypeResultOperatorOptimizer(QueryCompilationContext queryCompilationContext)
             {
-                private readonly NondeterministicResultCheckingVisitor _parentVisitor;
+                _queryCompilationContext = queryCompilationContext;
+            }
 
-                public RecursiveQueryModelExpressionVisitor(NondeterministicResultCheckingVisitor parentVisitor)
+            public override void VisitQueryModel(QueryModel queryModel)
+            {
+                base.VisitQueryModel(queryModel);
+
+                var ofTypeOperators = queryModel.ResultOperators.OfType<OfTypeResultOperator>().ToList();
+
+                foreach (var resultOperator in ofTypeOperators)
                 {
-                    _parentVisitor = parentVisitor;
+                    var searchedItemType = resultOperator.SearchedItemType;
+                    if (searchedItemType == queryModel.MainFromClause.ItemType)
+                    {
+                        queryModel.ResultOperators.Remove(resultOperator);
+                        continue;
+                    }
+
+                    var entityType = _queryCompilationContext.Model.FindEntityType(searchedItemType);
+
+                    if (entityType != null)
+                    {
+                        var oldQuerySource = queryModel.MainFromClause;
+                        queryModel.ResultOperators.Remove(resultOperator);
+
+                        var entityQueryProvider = ((oldQuerySource.FromExpression as ConstantExpression)?.Value as IQueryable)?.Provider as IAsyncQueryProvider;
+                        var newMainFromClause = new MainFromClause(
+                            oldQuerySource.ItemName,
+                            entityType.ClrType,
+                            CreateEntityQueryable(entityType, entityQueryProvider));
+                        queryModel.MainFromClause = newMainFromClause;
+
+                        var querySourceMapping = new QuerySourceMapping();
+                        querySourceMapping.AddMapping(oldQuerySource, new QuerySourceReferenceExpression(newMainFromClause));
+
+                        queryModel.TransformExpressions(e =>
+                            ReferenceReplacingExpressionVisitor
+                                .ReplaceClauseReferences(e, querySourceMapping, throwOnUnmappedReferences: false));
+
+                        foreach (var queryAnnotation in _queryCompilationContext.QueryAnnotations.Where(qa => qa.QuerySource == oldQuerySource))
+                        {
+                            queryAnnotation.QuerySource = newMainFromClause;
+                            queryAnnotation.QueryModel = queryModel;
+                        }
+                    }
                 }
 
-                protected override Expression VisitSubQuery(SubQueryExpression expression)
-                {
-                    _parentVisitor.VisitQueryModel(expression.QueryModel);
+                queryModel.TransformExpressions(new RecursiveQueryModelExpressionVisitor(this).Visit);
+            }
 
-                    return base.VisitSubQuery(expression);
-                }
+            private ConstantExpression CreateEntityQueryable(IEntityType targetEntityType, IAsyncQueryProvider entityQueryProvider)
+            => Expression.Constant(
+                _createEntityQueryableMethod
+                    .MakeGenericMethod(targetEntityType.ClrType)
+                    .Invoke(null, new object[]
+                    {
+                        entityQueryProvider
+                    }));
+
+            private static readonly MethodInfo _createEntityQueryableMethod
+                = typeof(NavigationRewritingExpressionVisitor)
+                    .GetTypeInfo().GetDeclaredMethod(nameof(_CreateEntityQueryable));
+
+            [UsedImplicitly]
+            // ReSharper disable once InconsistentNaming
+            private static EntityQueryable<TResult> _CreateEntityQueryable<TResult>(IAsyncQueryProvider entityQueryProvider)
+                => new EntityQueryable<TResult>(entityQueryProvider);
+        }
+
+        private class RecursiveQueryModelExpressionVisitor : ExpressionVisitorBase
+        {
+            private readonly QueryModelVisitorBase _parentVisitor;
+
+            public RecursiveQueryModelExpressionVisitor(QueryModelVisitorBase parentVisitor)
+            {
+                _parentVisitor = parentVisitor;
+            }
+
+            protected override Expression VisitSubQuery(SubQueryExpression expression)
+            {
+                _parentVisitor.VisitQueryModel(expression.QueryModel);
+
+                return base.VisitSubQuery(expression);
             }
         }
 
